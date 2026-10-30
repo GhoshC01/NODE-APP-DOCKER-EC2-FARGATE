@@ -1,0 +1,88 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/deploy-ec2.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: node-app
+  INSTANCE_ID: i-0dbf75ea3a7d9fefd
+  APP_URL: http://15.252.140.108
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── ১. কোড আনো ───
+      - uses: actions/checkout@v4
+
+      # ─── ২. AWS লগইন ───
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ─── ৩. Image বানাও আর ECR-এ রাখো ───
+      - name: Build and push image
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $IMAGE ./app
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      # ─── ৪. EC2-তে নতুন container চালাও ───
+      - name: Deploy on EC2 via SSM
+        run: |
+          REGISTRY=${{ steps.ecr.outputs.registry }}
+
+          cat > cmd.json <<EOF
+          {
+            "commands": [
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY",
+              "docker pull $IMAGE",
+              "docker rm -f node-app || true",
+              "docker run -d --name node-app --restart unless-stopped -p 80:3000 -v /opt/app/data:/app/data -e APP_VERSION=${{ github.sha }} $IMAGE",
+              "docker image prune -f"
+            ]
+          }
+          EOF
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids $INSTANCE_ID \
+            --document-name AWS-RunShellScript \
+            --parameters file://cmd.json \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command: $COMMAND_ID"
+          aws ssm wait command-executed --command-id $COMMAND_ID --instance-id $INSTANCE_ID
+
+          aws ssm get-command-invocation \
+            --command-id $COMMAND_ID --instance-id $INSTANCE_ID \
+            --query "StandardOutputContent" --output text
+
+      # ─── ৫. চেক করো নতুন ভার্সন এসেছে কিনা ───
+      - name: Validate deployment
+        run: |
+          for i in 1 2 3 4 5 6; do
+            RESPONSE=$(curl -s $APP_URL || true)
+            echo "Try $i: $RESPONSE"
+            if echo "$RESPONSE" | grep -q "${{ github.sha }}"; then
+              echo "✅ New version is live!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "❌ New version not found"
+          exit 1

@@ -1,0 +1,108 @@
+name: Deploy to Fargate
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/deploy-fargate.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: node-app-fargate
+  ECS_CLUSTER: node-app-fargate
+  ECS_SERVICE: node-app-fargate
+  TASK_FAMILY: node-app-fargate
+  CONTAINER_NAME: app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_FARGATE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ─── ১. Image বানাও আর রাখো ───
+      - name: Build and push image
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $IMAGE ./app
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      # ─── ২. বর্তমান রেসিপি পড়ো ───
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $TASK_FAMILY \
+            --query taskDefinition > task-def.json
+
+      # ─── ৩. রেসিপিতে image আর version বদলাও ───
+      - name: Update image and version
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE }}
+          environment-variables: |
+            APP_VERSION=${{ github.sha }}
+
+      # ─── ৪. নতুন রেসিপি জমা দাও ───
+      - name: Register and update service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+
+      # ─── ৫. container সংখ্যা ১, স্থির হওয়া পর্যন্ত অপেক্ষা ───
+      - name: Start one task and wait
+        run: |
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE \
+            --desired-count 1 > /dev/null
+          echo "Waiting for the service to become stable..."
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+
+      # ─── ৬. নতুন container-এর IP খোঁজো ───
+      - name: Find task public IP
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster $ECS_CLUSTER --service-name $ECS_SERVICE \
+            --desired-status RUNNING --query "taskArns[0]" --output text)
+
+          ENI_ID=$(aws ecs describe-tasks --cluster $ECS_CLUSTER --tasks $TASK_ARN \
+            --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" \
+            --output text)
+
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID \
+            --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+
+          echo "APP_URL=http://$PUBLIC_IP:3000" >> $GITHUB_ENV
+          echo "### 🚀 App URL: http://$PUBLIC_IP:3000" >> $GITHUB_STEP_SUMMARY
+
+      # ─── ৭. চেক করো ───
+      - name: Validate deployment
+        run: |
+          for i in 1 2 3 4 5 6; do
+            RESPONSE=$(curl -s $APP_URL || true)
+            if echo "$RESPONSE" | grep -q "${{ github.sha }}"; then
+              echo "✅ New version is live at $APP_URL"
+              exit 0
+            fi
+            echo "Try $i: not yet..."
+            sleep 10
+          done
+          echo "❌ New version not found at $APP_URL"
+          exit 1

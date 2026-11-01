@@ -255,9 +255,37 @@ resource "aws_ecs_service" "app" {
     assign_public_ip = true
   }
 
+  # নতুন: container চালু হলে নিজে ফোনবুকে নাম লেখাবে
+  service_registries {
+    registry_arn   = aws_service_discovery_service.app.arn
+    container_name = "app"
+    container_port = var.container_port
+  }
+
   depends_on = [aws_efs_mount_target.data]
 
   lifecycle {
     ignore_changes = [task_definition, desired_count]
+  }
+}
+
+# ─────────── 📒 Cloud Map: ফোনবুক ───────────
+
+resource "aws_service_discovery_private_dns_namespace" "main" {
+  name = "${var.app_name}.local"
+  vpc  = data.aws_vpc.default.id
+}
+
+resource "aws_service_discovery_service" "app" {
+  name = "node"
+
+  dns_config {
+    namespace_id   = aws_service_discovery_private_dns_namespace.main.id
+    routing_policy = "MULTIVALUE"
+
+    dns_records {
+      type = "SRV"
+      ttl  = 10
+    }
   }
 }

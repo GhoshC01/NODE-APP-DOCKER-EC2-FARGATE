@@ -155,6 +155,7 @@ function renderRows(files) {
 
 const CLIENT_SCRIPT = `
 (function () {
+  const BASE = window.location.pathname.replace(/\\/+$/, "");
   var containerId = "";
 
   function formatTime(iso) {
@@ -224,11 +225,11 @@ const CLIENT_SCRIPT = `
     setBusy(true);
     setStatus("Loading…");
     return Promise.all([
-      fetch("/api/info").then(function (response) {
+      fetch(BASE + "/api/info").then(function (response) {
         if (!response.ok) throw new Error("Could not load container info");
         return response.json();
       }),
-      fetch("/api/files").then(function (response) {
+      fetch(BASE + "/api/files").then(function (response) {
         if (!response.ok) throw new Error("Could not load files");
         return response.json();
       })
@@ -253,7 +254,7 @@ const CLIENT_SCRIPT = `
   document.getElementById("create").addEventListener("click", function () {
     setBusy(true);
     setStatus("Creating a file…");
-    fetch("/api/files", { method: "POST" })
+    fetch(BASE + "/api/files", { method: "POST" })
       .then(function (response) {
         if (!response.ok) throw new Error("Could not create file");
         return refresh();
@@ -280,7 +281,7 @@ const CLIENT_SCRIPT = `
     document.getElementById("confirm").hidden = true;
     setBusy(true);
     setStatus("Deleting files…");
-    fetch("/api/files", { method: "DELETE" })
+    fetch(BASE + "/api/files", { method: "DELETE" })
       .then(function (response) {
         if (!response.ok) throw new Error("Could not delete files");
         return refresh();

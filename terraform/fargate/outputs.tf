@@ -13,3 +13,7 @@ output "service_name" {
 output "efs_id" {
   value = aws_efs_file_system.data.id
 }
+
+output "discovery_service_arn" {
+  value = aws_service_discovery_service.app.arn
+}

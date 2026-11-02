@@ -1,11 +1,12 @@
-# Spec: Node.js Docker App on AWS EC2 and AWS Fargate
+# Spec: Node.js App on EC2, Fargate, and API Gateway
 
-This document describes how one small Node.js app is packaged with Docker and deployed to AWS in two different ways:
+This document describes one small Node.js app, packaged with Docker and deployed to AWS in two ways, plus a second tiny function and one HTTP API in front of both:
 
 1. **EC2**: a virtual machine that we manage ourselves.
 2. **Fargate**: serverless containers on ECS, with no machine to manage.
+3. **API Gateway**: one HTTP API. `/node` reaches the Fargate app. `/hello` reaches a Lambda function.
 
-Both deployments keep the files the app creates in a **persistent volume**, so the files survive when the container is replaced. Both are deployed automatically by **GitHub Actions** and built with **Terraform**.
+Both container deployments keep the files the app creates in a **persistent volume**, so the files survive when the container is replaced. Both are deployed automatically by **GitHub Actions** and built with **Terraform**. The Lambda and the API are created by Terraform in `terraform/gateway`. There is no GitHub Actions workflow for them. DNS for the custom domain is added by hand in Cloudflare. Terraform does not manage Cloudflare.
 
 ---
 
@@ -33,6 +34,27 @@ Both deployments keep the files the app creates in a **persistent volume**, so t
 
 Every file records which container created it. After a new deployment, the container ID changes, but older files are still listed with an **"older container"** badge. That shows the data lives outside the container.
 
+### Hello Lambda
+
+A second application, `lambda/hello/index.mjs`. It is not in Docker and it has no npm packages and no `package.json`.
+
+| Item | Value |
+|---|---|
+| Runtime | Node.js 22 (`nodejs22.x`) |
+| Handler | `index.handler` |
+| Function name | `node-app-hello` |
+| Event format | API Gateway HTTP API, payload format 2.0 |
+
+`GET /hello` returns JSON:
+
+| Field | Value |
+|---|---|
+| `app` | `hello-lambda` |
+| `message` | `Hello from AWS Lambda! 👋` |
+| `path` | `event.rawPath`, or `/` |
+| `method` | `event.requestContext.http.method`, or `GET` |
+| `time` | Current time in ISO format |
+
 ---
 
 ## 2. Repository Layout
@@ -42,6 +64,9 @@ NODE-APP-DOCKER-EC2-FARGATE/
 ├── app/
 │   ├── server.js
 │   └── Dockerfile
+├── lambda/
+│   └── hello/
+│       └── index.mjs
 ├── terraform/
 │   ├── ec2/
 │   │   ├── providers.tf
@@ -49,11 +74,19 @@ NODE-APP-DOCKER-EC2-FARGATE/
 │   │   ├── main.tf
 │   │   ├── github.tf
 │   │   └── outputs.tf
-│   └── fargate/
+│   ├── fargate/
+│   │   ├── providers.tf
+│   │   ├── variables.tf
+│   │   ├── main.tf
+│   │   ├── github.tf
+│   │   └── outputs.tf
+│   └── gateway/
 │       ├── providers.tf
 │       ├── variables.tf
-│       ├── main.tf
-│       ├── github.tf
+│       ├── lambda.tf
+│       ├── fargate.tf
+│       ├── api.tf
+│       ├── domain.tf
 │       └── outputs.tf
 ├── .github/workflows/
 │   ├── deploy-ec2.yml
@@ -62,18 +95,21 @@ NODE-APP-DOCKER-EC2-FARGATE/
 └── Spec.md
 ```
 
+`terraform/gateway/build/` is the Lambda zip. It is gitignored. `.terraform/` and `*.tfstate` are already ignored for every stack.
+
 ---
 
-## 3. Shared Foundations (used by both)
+## 3. Shared Foundations (used by all three)
 
 These pieces were created once, by hand, before either deployment.
 
 | Item | Example value | Purpose |
 |---|---|---|
-| AWS region | `ap-south-1` (Mumbai) | Where everything runs |
-| Terraform state bucket | `my-tf-state-bucket-ui-static-page-practice` | Stores Terraform state. EC2 uses key `ec2/terraform.tfstate`, Fargate uses `fargate/terraform.tfstate` |
+| AWS region | `ap-south-1` (Mumbai) | Where everything runs, including the API certificate |
+| Terraform state bucket | `my-tf-state-bucket-ui-static-page-practice` | Stores Terraform state. Keys: `ec2/terraform.tfstate`, `fargate/terraform.tfstate`, `gateway/terraform.tfstate` |
 | GitHub OIDC identity provider | `token.actions.githubusercontent.com` | Lets GitHub Actions log in to AWS without stored keys |
-| Default VPC and subnets | Provided by AWS | Network for both deployments. No custom VPC is created |
+| Default VPC and subnets | Provided by AWS | Network for both deployments and for the API Gateway VPC link. No custom VPC is created |
+| Domain | `digirg.dpdns.org` in Cloudflare | Terraform does not manage it. `api.digirg.dpdns.org` is added by hand |
 
 ### How GitHub Actions logs in to AWS (OIDC)
 
@@ -313,6 +349,10 @@ Also disable the workflow: GitHub → Actions → Deploy to EC2 → ··· → D
                ▼
            EFS: /app-data  (via access point)
 
+   The running task also registers itself in Cloud Map:
+   node.node-app.local  (SRV record, port 3000)
+   API Gateway uses that name. See Part C.
+
    Browser ─▶ http://<TASK_PUBLIC_IP>:3000
 ```
 
@@ -328,6 +368,7 @@ Also disable the workflow: GitHub → Actions → Deploy to EC2 → ··· → D
 | **IAM execution role** | Identity used by AWS to start the task | Pull the image, write logs |
 | **IAM task role** | Identity used by the running app | Mount and write to EFS |
 | **Amazon CloudWatch Logs** | Log storage | Container output (`console.log`), since there is no machine to log in to |
+| **AWS Cloud Map** | Private DNS for the task | The ECS service registers itself. API Gateway finds the task through this name |
 | **IAM role for GitHub** | Identity for the pipeline | Push to ECR, update the ECS service, find the task IP |
 
 ## B3. Service Specifications
@@ -382,9 +423,25 @@ How the task definition maps to the EC2 `docker run` command:
 | Desired count (Terraform) | `0` | The ECR repository is empty when Terraform runs |
 | Desired count (after deploy) | `1` | Set by the pipeline |
 | Subnets | All default VPC subnets | |
-| Public IP | Assigned | Needed to pull from ECR and to open the site, since there is no load balancer |
+| Public IP | Assigned | Needed to pull from ECR and to open the site directly. API Gateway is a second way in |
+| Cloud Map | `service_registries` | Registers container `app`, port `3000` |
 | Depends on | EFS mount targets | The task must not start before EFS is reachable |
 | Ignored changes | `task_definition`, `desired_count` | The pipeline owns these after the first apply |
+
+### AWS Cloud Map
+
+The ECS service writes its own address into a private DNS namespace in the default VPC. API Gateway does not use the task's public IP.
+
+| Setting | Value | Notes |
+|---|---|---|
+| Namespace | `node-app.local` | Private DNS, default VPC |
+| Service name | `node` | Full name `node.node-app.local` |
+| Record type | `SRV` | Carries the task IP and port 3000 |
+| Routing | `MULTIVALUE` | |
+| TTL | 10 seconds | |
+| Terraform output | `discovery_service_arn` | `terraform/gateway` reads this from the Fargate state |
+
+Apply `terraform/fargate` before `terraform/gateway`, so this output is saved in the Fargate state.
 
 ### Amazon EFS
 
@@ -577,14 +634,182 @@ terraform destroy
 
 ---
 
-# PART C: Side-by-Side Comparison
+# PART C: API Gateway and Lambda
+
+One Amazon API Gateway HTTP API sits in front of two applications. The Fargate app stays on its task IP as well. EC2 is not behind this API.
+
+```
+                         Cloudflare DNS (by hand, not Terraform)
+                         api.digirg.dpdns.org
+                                  │
+                                  ▼
+                    API Gateway HTTP API: node-app-api
+                    stage: $default    TLS certificate in ap-south-1
+                         │                          │
+           ANY /node, /node/*                       ANY /hello, /hello/*
+           strip the /node prefix                   payload format 2.0
+                         │                          │
+                         ▼                          ▼
+                  VPC Link                          Lambda: node-app-hello
+                  (default subnets)                 (no VPC)
+                         │
+                         ▼
+                  Cloud Map SRV: node.node-app.local
+                         │
+                         ▼
+                  Fargate task :3000
+```
+
+## C1. Routes
+
+| Route | Integration | What the app receives |
+|---|---|---|
+| `ANY /node` | VPC Link → Cloud Map | Path rewritten to `/` |
+| `ANY /node/{proxy+}` | VPC Link → Cloud Map | Path rewritten to `/{proxy}`, so `/node/health` arrives as `/health` |
+| `ANY /hello` | Lambda `node-app-hello` | The original HTTP API event |
+| `ANY /hello/{proxy+}` | Same Lambda | The original HTTP API event |
+
+Both Fargate integrations are `HTTP_PROXY` with method `ANY`. The connection is the VPC link, and `integration_uri` is `discovery_service_arn` from the Fargate remote state.
+
+| Integration | `overwrite:path` |
+|---|---|
+| `node_root` | `/` |
+| `node_proxy` | `/$request.path.proxy` |
+
+The Lambda integration is `AWS_PROXY` with `payload_format_version = "2.0"`. API Gateway is allowed to invoke the function (`source_arn` is the API execution ARN plus `/*/*`).
+
+## C2. AWS Services Used
+
+| Service | What it is | Why we need it |
+|---|---|---|
+| **API Gateway HTTP API** | One public HTTPS API | Stable URL for both apps. Name `node-app-api`, stage `$default`, `auto_deploy = true` |
+| **VPC Link** | Private connection into the default VPC | Reaches the Fargate task without a public load balancer. Name `node-app-vpc-link` |
+| **Cloud Map** | Created in `terraform/fargate` | Tells the VPC link which task IP and port to call |
+| **Lambda** | `node-app-hello` | The `/hello` application |
+| **IAM role** | `node-app-hello-lambda` | Lets Lambda write its own logs, and nothing else |
+| **CloudWatch Logs** | `/aws/lambda/node-app-hello` | Lambda output. Kept for 7 days |
+| **ACM** | Certificate for `api.digirg.dpdns.org` | TLS on the custom domain. Same region as the API, `ap-south-1` |
+| **Cloudflare** | DNS for `digirg.dpdns.org` | Not in Terraform. Records are added by hand |
+
+## C3. Lambda
+
+Terraform zips `lambda/hello` into `terraform/gateway/build/hello.zip` on every plan. That folder is gitignored.
+
+| Setting | Value |
+|---|---|
+| Function name | `node-app-hello` |
+| Runtime | `nodejs22.x` |
+| Handler | `index.handler` |
+| Role | `node-app-hello-lambda` |
+| Policy | `AWSLambdaBasicExecutionRole` only |
+| Log group | `/aws/lambda/node-app-hello`, 7 days |
+| Deploy | `terraform apply` in `terraform/gateway`. No GitHub Actions workflow |
+
+A change to `lambda/hello/index.mjs` is published by running `terraform apply` again. The zip hash is the function's `source_code_hash`.
+
+## C4. Network
+
+**VPC link security group** (`node-app-vpc-link-sg`)
+
+| Direction | Port | Source / Destination | Reason |
+|---|---|---|---|
+| Ingress | None | | API Gateway does not accept connections on this group |
+| Egress | All | `0.0.0.0/0` | Call the Fargate task on port 3000 |
+
+The task security group already allows port 3000 from the internet, so the VPC link can reach the container. The link uses every subnet in the default VPC.
+
+`terraform/gateway/fargate.tf` reads the Fargate state from S3 (`fargate/terraform.tfstate`) and looks up the default VPC and its subnets. It does not create them.
+
+## C5. Custom Domain
+
+The domain name variable defaults to `api.digirg.dpdns.org`.
+
+| Resource | Setting |
+|---|---|
+| `aws_acm_certificate.api` | DNS validation, `create_before_destroy` |
+| `aws_acm_certificate_validation.api` | Waits until the certificate is `ISSUED`. No `validation_record_fqdns`, because Cloudflare is updated by hand |
+| `aws_apigatewayv2_domain_name.api` | `REGIONAL` endpoint, security policy `TLS_1_2` |
+| `aws_apigatewayv2_api_mapping.api` | Maps the domain to API `node-app-api`, stage `$default` |
+
+The certificate is in `ap-south-1`, the same region as the API. It is not created in `us-east-1`.
+
+Two Cloudflare records, both **DNS only** (grey cloud). An orange-cloud proxy would terminate TLS at Cloudflare and hide the name ACM and API Gateway need to see.
+
+| Record | Type | Name | Target |
+|---|---|---|---|
+| Certificate check | CNAME | `resource_record_name` from output `acm_validation_records` | `resource_record_value` from that same output |
+| API | CNAME | `api` | output `custom_domain_target` |
+
+`terraform apply` creates the certificate first, then waits on validation. Add the validation CNAME in Cloudflare while that wait is running (the name and value are in the ACM console as soon as the certificate exists). After the certificate is issued, apply continues and creates the API domain. Then add the API CNAME from `custom_domain_target`.
+
+## C6. Commands
+
+Apply Fargate first when `discovery_service_arn` is not in its state yet.
+
+```bash
+cd terraform/fargate
+terraform init
+terraform plan
+terraform apply
+```
+
+```bash
+cd terraform/gateway
+terraform init
+terraform plan
+terraform apply
+terraform output
+```
+
+There is no `-var-file` and no `-backend-config`. Defaults are `ap-south-1`, app name `node-app`, domain `api.digirg.dpdns.org`.
+
+### Test through the default API URL
+
+```bash
+cd terraform/gateway
+curl "$(terraform output -raw node_url)"
+curl "$(terraform output -raw node_url)health"
+curl "$(terraform output -raw hello_url)"
+```
+
+`node_url` already ends with `/node/`.
+
+### Test through the custom domain
+
+```bash
+curl "$(terraform output -raw custom_node_url)"
+curl "$(terraform output -raw custom_node_url)health"
+curl "$(terraform output -raw custom_node_url)files"
+curl "$(terraform output -raw custom_hello_url)"
+```
+
+`/node/health` must return `OK` from the Fargate app, not a path that still contains `/node`. `/hello` must return JSON with `"app": "hello-lambda"`.
+
+### Lambda logs
+
+```bash
+aws logs tail /aws/lambda/node-app-hello --follow
+```
+
+### Delete the API and the Lambda
+
+```bash
+cd terraform/gateway
+terraform destroy
+```
+
+This does not delete the Fargate service, the EC2 instance, or the Cloudflare zone. Remove the two Cloudflare CNAMEs by hand.
+
+---
+
+# PART D: Side-by-Side Comparison
 
 | Topic | EC2 | Fargate |
 |---|---|---|
 | Who manages the machine | We do (OS, Docker, updates) | AWS |
 | What runs the container | `docker run` sent over SSM | ECS service from a task definition |
-| Public URL | `http://<EC2_IP>` (port 80) | `http://<TASK_IP>:3000` |
-| Does the IP change on deploy? | No | Yes (no load balancer) |
+| Public URL | `http://<EC2_IP>` (port 80) | `http://<TASK_IP>:3000`, and `https://api.digirg.dpdns.org/node/` |
+| Does the IP change on deploy? | No | The task IP changes. The API Gateway URL does not |
 | Persistent storage | Folder on the EC2 disk (bind mount) | EFS through an access point |
 | Data survives deleting the compute? | No | Yes (EFS is separate) |
 | Restart on failure | `--restart unless-stopped` | ECS health check replaces the task |
@@ -596,7 +821,7 @@ terraform destroy
 
 ---
 
-# PART D: Security Summary
+# PART E: Security Summary
 
 - **No long-lived AWS keys.** GitHub Actions uses OIDC and short-lived credentials.
 - **Trust is locked to this repository** by the `sub` condition in each GitHub role.
@@ -605,10 +830,15 @@ terraform destroy
 - **EFS is reachable only from app tasks** (security group) **and only with the task role** (IAM authorization).
 - **Encryption.** EFS is encrypted at rest and in transit.
 - **Image scanning** is enabled on both ECR repositories.
+- **Lambda can only write logs.** Its role has `AWSLambdaBasicExecutionRole` and no other permissions.
+- **The VPC link security group has no ingress rules.** It is only used for outbound calls to the task.
+- **Cloud Map is private.** The name `node.node-app.local` is not a public DNS name. Only the VPC link, inside the default VPC, uses it.
+- **The API certificate is regional.** It lives in `ap-south-1` with the HTTP API.
+- **Cloudflare is outside Terraform.** Only the two CNAMEs in section C5 are added there, both as DNS only.
 
 ---
 
-# PART E: Troubleshooting Notes
+# PART F: Troubleshooting Notes
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -619,3 +849,8 @@ terraform destroy
 | Fargate task stops right away | EFS mount failed | Check EFS security group (2049 from task SG), task role, and that mount targets are `available` |
 | Fargate validation fails | Task still starting or health check failing | `aws logs tail /ecs/node-app-fargate --follow` |
 | Red EC2 run after EC2 was destroyed | EC2 workflow still enabled | Disable "Deploy to EC2" in GitHub Actions |
+| Gateway plan cannot read `discovery_service_arn` | Fargate was not applied after that output was added | `terraform apply` in `terraform/fargate`, then plan again in `terraform/gateway` |
+| `terraform apply` waits on the certificate | Cloudflare validation CNAME is missing, or the record is proxied | Add the CNAME from ACM as DNS only, then leave the apply running |
+| Custom domain does not open | API CNAME is missing, or Cloudflare is proxying it | CNAME `api` to `custom_domain_target`, DNS only |
+| `/node/health` is not `OK` | The `/node` prefix was not removed | `/node` rewrites to `/`. `/node/{proxy+}` rewrites to `/$request.path.proxy` |
+| `/hello` is forbidden | API Gateway cannot invoke the function | `aws_lambda_permission.hello` allows `apigateway.amazonaws.com` |

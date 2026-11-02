@@ -3,4 +3,5 @@ app/data/
 *.tfstate
 *.tfstate.*
 tfplan
+terraform/gateway/build/
 .env

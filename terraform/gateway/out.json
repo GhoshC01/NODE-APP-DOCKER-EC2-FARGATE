@@ -1,0 +1,1 @@
+{"statusCode":200,"headers":{"content-type":"application/json"},"body":"{\n  \"app\": \"hello-lambda\",\n  \"message\": \"Hello from AWS Lambda! 👋\",\n  \"path\": \"/test\",\n  \"method\": \"GET\",\n  \"time\": \"2026-11-01T20:22:13.891Z\"\n}"}
